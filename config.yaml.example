@@ -1,0 +1,119 @@
+# AI 资讯自动化流水线配置
+# 复制为 config.yaml 并填入真实值
+
+pipeline:
+  # 文章输出根目录（相对项目根目录）
+  articles_dir: data/articles
+  raw_dir: data/raw
+  processed_dir: data/processed
+  timezone: Asia/Shanghai
+
+schedule:
+  # 每日执行时间（用于文档与定时任务参考）
+  run_at: "08:00"
+  # 每次最多选几个话题进入候选
+  max_topics: 3
+  # 每天实际发布几篇（1 = 只发评分最高的一条）
+  publish_count: 1
+
+account:
+  # 默认微信公众号账号 key，对应 wechat-publisher.yaml 中的 accounts
+  default: main
+
+wechat_publisher:
+  # wechat-publisher skill 路径。三种解析方式：
+  #   1. 相对路径（默认）：相对 skills 目录，同级布局自动解析
+  #      例: wechat-publisher  →  <skills>/wechat-publisher/
+  #   2. 绝对路径：写完整路径
+  #      例: /home/user/.codex/skills/wechat-publisher
+  #   3. 环境变量 WECHAT_PUBLISHER_PATH（优先级最高，覆盖此配置）
+  skill_path: wechat-publisher
+  scripts_dir: scripts
+
+collectors:
+  # Hacker News Algolia 搜索关键词
+  hn_queries:
+    - "AI agent"
+    - "LLM"
+    - "OpenAI"
+    - "Claude"
+    - "Gemini"
+  hn_max_per_query: 5
+  hn_hours_back: 48
+
+  # RSS 源（title 用于日志，url 为 feed 地址）
+  rss_feeds:
+    - title: OpenAI Blog
+      url: https://openai.com/blog/rss.xml
+      weight: 1.2
+    - title: Google AI Blog
+      url: https://blog.google/technology/ai/rss/
+      weight: 1.1
+    - title: Hugging Face Blog
+      url: https://huggingface.co/blog/feed.xml
+      weight: 1.0
+    - title: MIT Technology Review AI
+      url: https://www.technologyreview.com/topic/artificial-intelligence/feed
+      weight: 0.9
+    # X/Twitter via nitter.net RSS (purpose: learning = personal only, not published)
+    - title: Andrej Karpathy
+      url: https://nitter.net/karpathy/rss
+      weight: 1.5
+      purpose: learning
+    - title: Sam Altman
+      url: https://nitter.net/sama/rss
+      weight: 1.3
+      purpose: both
+
+  # 只保留最近 N 小时内的条目
+  max_age_hours: 72
+
+processor:
+  # 关键词加权（标题/摘要命中加分）
+  keyword_boost:
+    - term: agent
+      weight: 2.0
+    - term: gpt
+      weight: 1.5
+    - term: claude
+      weight: 1.5
+    - term: openai
+      weight: 1.3
+    - term: benchmark
+      weight: 1.2
+  min_score: 3.0
+  # Keyword boost rewrite: cap each term to 1 hit (anti-spam), cap total
+  keyword_boost_per_term_cap: 1.0
+  keyword_boost_total_cap: 4.0
+  # First-party / authoritative source bonus (re-asserts source trust)
+  source_authority_bonus: 1.0
+  dedupe_similarity: 0.85
+  # LLM three-gate scorer (importance/timeliness/actionability). Additive blend
+  # after heuristic粗筛; lets important items cross the threshold regardless of
+  # low source feed_weight. Falls back to pure heuristic if llm.api_key missing.
+  llm_scorer:
+    enabled: true
+    evaluate_top_n: 15
+    batch_size: 5
+    concurrency: 3
+
+generator:
+  # 是否启用 LLM 自动生成 article.md（需要 llm 配置）
+  enabled: false
+  # 文章结构偏好：data-first | timeline-news | teardown | field-notes 等
+  article_structure: timeline-news
+  opening_hook: hard-number
+  target_words: 3000
+
+llm:
+  # OpenAI 兼容 API（启用 generator.enabled 时必填）
+  base_url: https://api.openai.com/v1
+  api_key: sk-...
+  model: gpt-4o
+  temperature: 0.7
+
+publish:
+  # 是否在 article.md 就绪后自动发布到微信草稿箱
+  auto_publish: false
+  ai_score_threshold: 45
+  skip_ai_score: false
