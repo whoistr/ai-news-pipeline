@@ -20,15 +20,6 @@ dependencies:
     required_for: publish (阶段四)
     install: npx skills add jiji262/wechat-publisher
     note: 仅推送阶段需要；采集/处理/输出可不装
-
-  触发场景（只要沾边就该使用本 skill）：
-  - 用户提到"采集"、"抓取资讯"、"采集资讯"、"抓新闻"等关键词
-  - 用户提到"资讯日报"、"每日日报"、"AI 日报"、"digest"、"卡片日报"
-  - 用户要求筛选 / 评分 / 排序 / 去重资讯
-  - 用户要求"跑流水线"、"跑日报"、"run daily"、"今日资讯"
-  - 用户提到"推送到公众号"、"发草稿"、"发布日报"
-  - 用户要求把采集到的资讯生成文章并发布
-  - 用户要求规划选题 / 生成 brief
 ---
 
 # AI 资讯自动化流水线
@@ -81,9 +72,9 @@ python run.py daily
 
 - **Python >= 3.10**，核心依赖见 `requirements.txt`（requests / feedparser / pyyaml / python-dateutil）
 - **wechat-publisher skill** — 推送阶段（阶段四）的**硬依赖**。必须先安装，否则 publish / digest 自动推送不可用：
-  `ash
+  ```bash
   npx skills add jiji262/wechat-publisher
-  `
+  ```
   安装后放在同级 skills 目录即可自动发现。采集 / 处理 / 输出（阶段一至三）不需要它，可独立使用。
 - **LLM API**：OpenAI 兼容接口（如 GLM、DeepSeek、OpenAI），不配也能跑（降级为纯启发式评分）
 
