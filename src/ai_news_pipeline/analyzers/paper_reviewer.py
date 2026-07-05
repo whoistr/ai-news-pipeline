@@ -109,25 +109,20 @@ def _detect_ccf_in_abstract(abstract: str) -> tuple:
 
 _BATCH_REVIEW_PROMPT = """你是一位顶会审稿人。请对以下 {count} 篇 arXiv 论文进行严格评审。
 
-对每篇论文，只输出一个 JSON 对象。用 JSON 数组包裹所有结果：
+对每篇论文，输出一个 JSON 对象（含结构化字段）。用 JSON 数组包裹：
 [
   {{
     "idx": 论文编号,
-    "innovation": "一句话概括核心创新（若非原创算法而是应用调参，标记为「工程性」）",
-    "limitation": "最大局限性（如：缺少对比、数据集偏小、假设过强）",
+    "method": "核心方法（1-2句，说清楚用什么技术解决了什么问题）",
+    "innovation": "创新点（一句话，若非原创算法而是应用调参，标记为「工程性」）",
+    "experiment": "实验数据（关键指标/数据集/对比结果，如：在MMLU上达89.3%超越GPT-4）",
+    "limitation": "局限性（最大短板：缺少对比/数据集偏小/假设过强等）",
+    "reproduction": "复现路径（是否有开源代码/GitHub链接/数据集，若无标注「闭源」）",
+    "related_work": "关联工作（与此最相关的1-2篇论文或技术，如：扩展了Chain-of-Thought）",
     "rating": 数字1-5,
     "reason": "给这个评级的简要理由（30字以内）"
   }},
-  ...
-]
-
-评级标准：
-5 = 突破性创新，理论+实验双强
-4 = 扎实创新，实验充分
-3 = 有亮点但局限明显
-2 = 增量改进，实验不足
-1 = 概念炒作/水文
-
+  ...]
 下面是待审论文：
 {papers}"""
 
@@ -178,7 +173,7 @@ def _call_llm_batch(items: list[NewsItem], cfg: PipelineConfig) -> list[dict[str
                 json={
                     "model": model,
                     "temperature": 0.3,
-                    "max_tokens": 800 * len(items),
+                    "max_tokens": 1200 * len(items),
                     "messages": [
                         {"role": "system", "content": "你是一位严格的顶会审稿人。只输出 JSON 数组，不要任何额外文字。"},
                         {"role": "user", "content": prompt},
@@ -210,8 +205,12 @@ def _call_llm_batch(items: list[NewsItem], cfg: PipelineConfig) -> list[dict[str
                             "title": items[idx].title,
                             "url": items[idx].url,
                             "source": items[idx].source,
+                            "method": r.get("method", ""),
                             "innovation": r.get("innovation", ""),
+                            "experiment": r.get("experiment", ""),
                             "limitation": r.get("limitation", ""),
+                            "reproduction": r.get("reproduction", ""),
+                            "related_work": r.get("related_work", ""),
                             "rating": int(r.get("rating", 2)),
                             "reason": r.get("reason", ""),
                         })
@@ -226,8 +225,12 @@ def _call_llm_batch(items: list[NewsItem], cfg: PipelineConfig) -> list[dict[str
                         "title": items[i].title,
                         "url": items[i].url,
                         "source": items[i].source,
+                        "method": r.get("method", ""),
                         "innovation": r.get("innovation", ""),
+                        "experiment": r.get("experiment", ""),
                         "limitation": r.get("limitation", ""),
+                        "reproduction": r.get("reproduction", ""),
+                        "related_work": r.get("related_work", ""),
                         "rating": int(r.get("rating", 2)),
                         "reason": r.get("reason", ""),
                     })

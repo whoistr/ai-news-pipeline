@@ -21,6 +21,18 @@ class RssCollector(BaseCollector):
         self.feeds: list[dict] = coll.get("rss_feeds", [])
         self.max_age_hours: int = int(coll.get("max_age_hours", 72))
         self.date_str = date_str
+        # Nitter throttling: nitter.net rate-limits rapid back-to-back requests
+        # (ConnectionReset 10054). We interleave a delay between nitter feeds and
+        # use a longer retry backoff than for normal RSS.
+        nt = coll.get("nitter_throttle", {})
+        self.nitter_delay: float = float(nt.get("delay_seconds", 1.5))
+        self.nitter_retry_delay: float = float(nt.get("retry_delay_seconds", 5))
+        self.nitter_max_retries: int = int(nt.get("max_retries", 3))
+        self._last_nitter_req: float = 0.0
+
+    @staticmethod
+    def _is_nitter(url: str) -> bool:
+        return "nitter.net" in url or "nitter.cz" in url or "nitter.poast.org" in url
 
     def collect(self) -> list[NewsItem]:
         if self.date_str:
@@ -66,13 +78,56 @@ class RssCollector(BaseCollector):
             "hype_patterns": af.get("hype_title_patterns", []),
         }
 
+    def _fetch_with_throttle(self, feed_url: str, is_nitter: bool):
+        """Fetch URL with nitter-aware retry and throttling.
+
+        Normal RSS: 3 attempts, 3s/6s backoff (unchanged behavior).
+        Nitter:     enforce inter-request delay + longer backoff (5s/10s/15s)
+                    to survive nitter.net's rate limiter.
+        """
+        import time as _time
+
+        if is_nitter and self.nitter_delay > 0:
+            elapsed = _time.time() - self._last_nitter_req
+            if elapsed < self.nitter_delay:
+                _time.sleep(self.nitter_delay - elapsed)
+
+        max_attempts = self.nitter_max_retries if is_nitter else 3
+        for attempt in range(max_attempts):
+            try:
+                resp = requests.get(
+                    feed_url, timeout=30,
+                    headers={"User-Agent": "Mozilla/5.0 (ai-news-pipeline)"},
+                )
+                resp.raise_for_status()
+                if is_nitter:
+                    self._last_nitter_req = _time.time()
+                return resp
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if is_nitter:
+                    # Nitter rate-limits: wait for the limit window to reset.
+                    wait = self.nitter_retry_delay * (attempt + 1)
+                    if attempt < max_attempts - 1:
+                        print(f"  [RSS] nitter retry {attempt+1}/{max_attempts} "
+                              f"in {wait}s: {type(e).__name__}")
+                        _time.sleep(wait)
+                        continue
+                else:
+                    if attempt < 2:
+                        _time.sleep(3 * (attempt + 1))
+                        continue
+                raise
+
     def _fetch_feed(
         self, source_title: str, feed_url: str, weight: float,
         start_utc: datetime, end_utc: datetime,
         feed_cfg: dict | None = None,
     ) -> list[NewsItem]:
-        resp = requests.get(feed_url, timeout=30, headers={"User-Agent": "ai-news-pipeline/0.1"})
-        resp.raise_for_status()
+        # Nitter sources need special handling: nitter.net rate-limits rapid
+        # back-to-back requests (ConnectionReset 10054). We throttle inter-request
+        # delay and use a longer retry backoff for nitter URLs.
+        is_nitter = self._is_nitter(feed_url)
+        resp = self._fetch_with_throttle(feed_url, is_nitter)
         parsed = feedparser.parse(resp.content)
 
         arxiv_filter = self._load_arxiv_filter() if self._is_arxiv_feed(feed_url) else None

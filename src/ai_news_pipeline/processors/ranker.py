@@ -35,12 +35,31 @@ def _is_arxiv(item: NewsItem) -> bool:
 def _is_semiconductor(item: NewsItem) -> bool:
     """An item belongs to the semiconductor vertical if tagged or keyword-matched."""
     tags = item.tags or []
-    # NOTE: we deliberately do NOT trust a feed-level "semiconductor" tag here.
-    # Some RSS sources (e.g. AnandTech/Tom's Hardware) are general hardware media
-    # tagged with category=semiconductor at the feed level, which would force every
-    # item from that feed into the semiconductor bucket even when the item is about
-    # AI agent security or unrelated news. We judge by CONTENT keywords only; the
-    # feed tag is kept for downstream weighting but not for hard classification.
+    text = f"{item.title} {item.summary}".lower()
+    # ArXiv papers from semiconductor-tagged feeds (eess.SP, cond-mat.mes-hall)
+    # are often cross-listed from OTHER fields. eess.SP (signal processing) in
+    # particular carries many AI/comm/radar papers that have nothing to do with
+    # semiconductor physics. Only trust the feed tag if the content does NOT look
+    # like a pure AI/ML/communications paper.
+    if _is_arxiv(item) and "semiconductor" in tags:
+        # AI/ML papers cross-listed into eess.SP should go to AI-papers, not semi.
+        ai_keywords = [
+            "llm", "gpt", "large language model", "transformer",
+            "autonomous driving", "self-driving", "end-to-end learning",
+            "deep learning", "neural network", "reinforcement learning",
+            "image classification", "object detection", "semantic segmentation",
+            "channel estimation", "wireless", "mimo", "ofdm", "csi ",
+            "radar detection", "spectral efficiency", "beamforming",
+            "text-to-image", "diffusion model", "vision-language",
+        ]
+        ai_hits = sum(1 for kw in ai_keywords if kw in text)
+        if ai_hits >= 2:
+            return False
+        return True
+    # For news feeds, do NOT trust the feed-level tag. Sources like AnandTech /
+    # Tom's Hardware are general hardware media tagged category=semiconductor at
+    # the feed level, which would force AI/gaming/deals news into the semiconductor
+    # bucket. Judge those by CONTENT keywords only.
     text = f"{item.title} {item.summary}".lower()
     # Short acronyms (dram/nand/euv/...) must match as whole words, otherwise
     # substrings cause false positives: "dram" inside "dramatically". Longer
@@ -61,8 +80,6 @@ def _is_semiconductor(item: NewsItem) -> bool:
         elif kw in text:
             return True
     return False
-
-
 def _recency_boost(published_at: str | None) -> float:
     if not published_at:
         return 0.5
@@ -98,7 +115,6 @@ def _keyword_boost(text: str, cfg: PipelineConfig) -> float:
         if term and term.lower() in text_lower:
             boost += min(weight, per_term_cap)
     return min(boost, total_cap)
-    return boost
 
 
 def _arxiv_quality_factor(item: NewsItem) -> float:
@@ -128,10 +144,25 @@ def _arxiv_quality_factor(item: NewsItem) -> float:
                   "empower", "revolutionize", "rethink", "pioneering",
                   "comprehensive", "robust", "scalable", "towards", "exploring"]
     concrete_terms = ["accuracy", "f1", "bleu", "rouge", "mmlu", "humaneval",
-                      "imagenet", "coco", "sota", "state-of-the-art",
-                      "dataset", "experiment", "ablation", "outperform",
-                      "achieve", "improve", "reduce", "%", "percent",
-                      "baseline", "benchmark", "evaluation", "results"]
+                     "imagenet", "coco", "sota", "state-of-the-art",
+                     "dataset", "experiment", "ablation", "outperform",
+                     "achieve", "improve", "reduce", "%", "percent",
+                     "baseline", "benchmark", "evaluation", "results"]
+    # Semiconductor physics papers have their own vocabulary of concrete
+    # experimental evidence. Without recognizing these, the "no concrete signals"
+    # penalty below unfairly crushes physics papers whose abstracts describe real
+    # device measurements but never mention ML metrics like F1/accuracy.
+    if "semiconductor" in (item.tags or []):
+        concrete_terms = concrete_terms + [
+            "conductivity", "resistance", "voltage", "capacitance", "impedance",
+            "transistor", "heterostructure", "lattice", "ferromagnet",
+            "superconduct", "magnetoresistance", "hall effect", "spin current",
+            "photovoltage", "photocurrent", "deposition", "doping",
+            "spectroscopy", "microscopy", "fabricated", "measured",
+            "synthesized", "crystal", "thin film", "substrate", "band gap",
+            "nanowire", "electric field", "raman", "frequency", "wavelength",
+            "temperature", "simulation", "GHz", "THz", "nanometer",
+        ]
 
     hype_count = sum(1 for t in hype_terms if t in text)
     concrete_count = sum(1 for t in concrete_terms if t in text)
@@ -336,7 +367,32 @@ def _score_item(item: NewsItem, cfg: PipelineConfig) -> float:
     )
 
 
+def _extract_key_entities(title: str) -> set[str]:
+    """Extract proper-noun entities from a title for semantic dedup.
+
+    Catches duplicates that title-similarity misses: "Anthropic explores
+    custom chip with Samsung" vs "Anthropic is discussing a new chip with
+    Samsung" share the same entities but only ~0.45 title similarity.
+    """
+    entities = set()
+    words = re.findall(r"[A-Z][a-zA-Z0-9]+", title)
+    # Filter out common sentence-starters that aren't entities
+    stop = {"The", "A", "An", "This", "These", "Those", "That", "What",
+            "Why", "How", "When", "Where", "Will", "Can", "Could", "Should",
+            "New", "Best", "Top", "Most", "More", "Using", "After", "Before"}
+    for w in words:
+        if len(w) >= 3 and w not in stop:
+            entities.add(w.lower())
+    return entities
+
+
+def _entity_overlap(a: str, b: str) -> int:
+    """Count shared key entities between two titles."""
+    return len(_extract_key_entities(a) & _extract_key_entities(b))
+
+
 def _dedupe_items(items: list[NewsItem], threshold: float) -> list[NewsItem]:
+
     kept: list[NewsItem] = []
     for item in sorted(items, key=lambda x: x.score, reverse=True):
         duplicate = False
@@ -345,6 +401,12 @@ def _dedupe_items(items: list[NewsItem], threshold: float) -> list[NewsItem]:
                 duplicate = True
                 break
             if item.url == existing.url:
+                duplicate = True
+                break
+            # Entity-based semantic dedup: different headlines about the same
+            # story share key entities (company + product names). If 2+ shared
+            # entities AND moderate title similarity, treat as duplicate.
+            if _entity_overlap(item.title, existing.title) >= 2 and                _title_similarity(item.title, existing.title) >= 0.35:
                 duplicate = True
                 break
         if not duplicate:
@@ -391,15 +453,15 @@ def process_items(items: list[NewsItem], cfg: PipelineConfig, skip_llm: bool = F
     """
     proc = cfg.config.get("processor", {})
     threshold = float(proc.get("dedupe_similarity", 0.85))
-    min_score_news = float(proc.get("min_score_news", 3.0))
-    min_score_papers = float(proc.get("min_score_papers", 2.5))
-    cap_news = int(proc.get("cap_news", 10))
-    cap_papers = int(proc.get("cap_papers", 10))
-    min_score_semi = float(proc.get("min_score_semiconductor", 2.0))
+    min_score_news = float(proc.get("learning_min_score_news" if skip_llm else "min_score_news", proc.get("min_score_news", 3.0)))
+    min_score_papers = float(proc.get("learning_min_score_papers" if skip_llm else "min_score_papers", proc.get("min_score_papers", 2.5)))
+    cap_news = int(proc.get("learning_cap_news" if skip_llm else "cap_news", proc.get("cap_news", 10)))
+    cap_papers = int(proc.get("learning_cap_papers" if skip_llm else "cap_papers", proc.get("cap_papers", 10)))
+    min_score_semi = float(proc.get("learning_min_score_semiconductor" if skip_llm else "min_score_semiconductor", proc.get("min_score_semiconductor", 2.0)))
     cap_semi = int(proc.get("cap_semiconductor", 5))
-    min_score_semi_papers = float(proc.get("min_score_semiconductor_papers", 2.0))
-    cap_semi_news = int(proc.get("cap_semiconductor_news", cap_semi))
-    cap_semi_papers = int(proc.get("cap_semiconductor_papers", 3))
+    min_score_semi_papers = float(proc.get("learning_min_score_semiconductor_papers" if skip_llm else "min_score_semiconductor_papers", proc.get("min_score_semiconductor_papers", 2.0)))
+    cap_semi_news = int(proc.get("learning_cap_semiconductor_news" if skip_llm else "cap_semiconductor_news", cap_semi))
+    cap_semi_papers = int(proc.get("learning_cap_semiconductor_papers" if skip_llm else "cap_semiconductor_papers", 3))
 
     # Split: semiconductor first, then arxiv papers, remainder = AI news
     semi_items = [i for i in items if _is_semiconductor(i)]
@@ -467,7 +529,16 @@ def process_items(items: list[NewsItem], cfg: PipelineConfig, skip_llm: bool = F
             for item in deduped:
                 hit = llm_scores.get(item.url)
                 if hit:
-                    item.score = round(item.score + hit["bonus"], 3)
+                    new_score = round(item.score + hit["bonus"], 3)
+                    # Semiconductor arXiv papers are judged by an AI-focused LLM
+                    # that rates niche physics as "unimportant" (importance 1-2).
+                    # Don't let that negative bonus eliminate papers that already
+                    # passed quality filtering at collection time. Floor at the
+                    # heuristic base so positive bonuses still rank them, but
+                    # negative ones can't drop them below their natural score.
+                    if is_arxiv and "semiconductor" in (item.tags or []) and new_score < item.score:
+                        new_score = item.score
+                    item.score = new_score
                     item.raw = item.raw or {}
                     item.raw["llm_gates"] = {
                         "importance": hit["importance"],
@@ -486,12 +557,20 @@ def process_items(items: list[NewsItem], cfg: PipelineConfig, skip_llm: bool = F
                 print(f"  [{label}] LLM bonus applied to {boosted} items")
             deduped.sort(key=lambda x: x.score, reverse=True)
         result = []
+        source_counts: dict[str, int] = {}
+        # Cap items from the same source so one prolific blog (e.g. Simon
+        # Willison posting 5 items in a day) does not dominate the digest.
+        per_source_cap = 3
         for item in deduped:
             if item.score < min_score:
+                continue
+            src = (item.source or "").strip()
+            if source_counts.get(src, 0) >= per_source_cap:
                 continue
             item.raw = item.raw or {}
             item.raw["useful"] = _is_useful(item, is_arxiv, item.score)
             result.append(item)
+            source_counts[src] = source_counts.get(src, 0) + 1
             if len(result) >= cap:
                 break
         useful = sum(1 for i in result if i.raw.get("useful"))
@@ -564,11 +643,49 @@ def process_items(items: list[NewsItem], cfg: PipelineConfig, skip_llm: bool = F
                             "why_worth": hit.get("why_worth", ""),
                             "core_points": hit.get("core_points") or [],
                         }
-                # Re-sort each category after backfill bonuses
-                news_ranked.sort(key=lambda x: x.score, reverse=True)
-                papers_ranked.sort(key=lambda x: x.score, reverse=True)
-                semi_news_ranked.sort(key=lambda x: x.score, reverse=True)
-                semi_papers_ranked.sort(key=lambda x: x.score, reverse=True)
+                # After backfill, re-sort AND re-filter each category.
+                # Backfill can push items below min_score (e.g. an off-topic
+                # news item that scored importance=1, bonus=-6.5). Without
+                # re-filtering, those items survive into the digest even though
+                # the LLM explicitly rated them irrelevant.
+                def _replenish(ranked, all_items, min_score, cap, label, is_arxiv):
+                    ranked.sort(key=lambda x: x.score, reverse=True)
+                    ranked = [i for i in ranked if i.score >= min_score]
+                    if len(ranked) >= cap:
+                        return ranked[:cap]
+                    # Fill from the full deduped pool (items that already have
+                    # LLM scores from backfill or the main pass, but didn't
+                    # survive the first cap cut).
+                    existing_urls = {i.url for i in ranked}
+                    # Respect per-source cap during replenish too
+                    src_counts = {}
+                    for i in ranked:
+                        s = (i.source or "").strip()
+                        src_counts[s] = src_counts.get(s, 0) + 1
+                    pool = _dedupe_items(all_items, threshold)
+                    pool.sort(key=lambda x: x.score, reverse=True)
+                    for item in pool:
+                        if len(ranked) >= cap:
+                            break
+                        if item.url in existing_urls:
+                            continue
+                        if item.score < min_score:
+                            break
+                        gates = (item.raw or {}).get("llm_gates")
+                        if not gates:
+                            continue  # skip items without LLM eval
+                        s = (item.source or "").strip()
+                        if src_counts.get(s, 0) >= 3:
+                            continue  # per-source cap
+                        item.raw["useful"] = _is_useful(item, is_arxiv, item.score)
+                        ranked.append(item)
+                        existing_urls.add(item.url)
+                        src_counts[s] = src_counts.get(s, 0) + 1
+                    return ranked[:cap]
+                news_ranked = _replenish(news_ranked, news_items, min_score_news, cap_news, "news", False)
+                papers_ranked = _replenish(papers_ranked, arxiv_items, min_score_papers, cap_papers, "papers", True)
+                semi_news_ranked = _replenish(semi_news_ranked, semi_news, min_score_semi, cap_semi_news, "semiconductor_news", False)
+                semi_papers_ranked = _replenish(semi_papers_ranked, semi_papers, min_score_semi_papers, cap_semi_papers, "semiconductor_papers", True)
             except Exception as e:  # noqa: BLE001
                 print(f"  [LLMScore:backfill] failed ({e}); leaving heuristic scores")
 
@@ -583,36 +700,48 @@ def process_items(items: list[NewsItem], cfg: PipelineConfig, skip_llm: bool = F
 def _filter_by_purpose(items: list[NewsItem], purpose: str) -> list[NewsItem]:
     """Keep items whose source purpose matches.
 
-    purpose="publish" -> keep publish + both.
-    purpose="learning" -> keep learning + both.
+    purpose="publish" -> keep publish + both (curated, for WeChat).
+    purpose="learning" -> keep ALL sources (publish + learning + both).
     Items without a feed_purpose tag default to "publish".
+
+    Rationale: the learning pool is the personal knowledge base -- it should
+    capture everything, including official blog posts and media articles, not
+    just KOL tweets. The publish pool is curated for public consumption, so it
+    only includes sources explicitly marked publish or both.
     """
     out = []
     for it in items:
         fp = (it.raw or {}).get("feed_purpose", "publish")
-        if fp == "both" or fp == purpose:
+        if purpose == "learning":
+            out.append(it)
+        elif fp == "both" or fp == "publish":
             out.append(it)
     return out
 
 
 def _x_topic_boost(items: list[NewsItem], cfg: PipelineConfig) -> None:
-    """????:? X ??? x_keywords ????????(???? score)?
+    """X 推文主题加权：按 config 的 x_keywords 对 X 内容做主题匹配并加权（加到 score）。
 
-    nitter ??? RSS ??,????????????"?????"????
-    ?????:? learning ??? X ????,? config ? x_keywords ?
-    ????+??,????????? topic ? boost ????? AI Agent /
-    LLM / RAG ??????? learning ??????,???"????"?
-    ?? X ??(x-kol/x-official tag)??,????? RSS ???
+    nitter 抓取的 RSS 噪声大，需要从碎片化的"信息流"里捞出"有价值的洞察"。
+    设计意图：在 learning 模式下，X 内容质量参差，靠 config 的 x_keywords 做
+    关键词+主题匹配，给匹配到 topic 的 boost 加权，让 AI Agent /
+    LLM / RAG 等热门话题在 learning 结果里浮上来，形成"个人精选"。
+    仅对 X 内容（x-kol/x-official tag）生效，不影响其他 RSS 源。
     """
     x_topics = cfg.config.get("processor", {}).get("x_keywords", [])
-    if not x_topics:
-        return
+    # Base lift for ALL X content in the learning pool. X/KOL tweets have low
+    # heuristic scores (short text, no authority bonus) and get crowded out by
+    # official blogs (feed_weight 1.0-1.4 + authority 1.0). This base lift
+    # ensures X content stays competitive so technical KOL insights aren't lost.
+    x_base_lift = float(cfg.config.get("processor", {}).get("x_base_lift", 1.5))
     boosted = 0
     for item in items:
         tags = item.tags or []
         is_x = "x-kol" in tags or "x-official" in tags
         if not is_x:
             continue
+        # Apply base lift first (levels the playing field vs official sources)
+        item.score = round(item.score + x_base_lift, 3)
         text = (f"{item.title} {item.summary}").lower()
         best_boost = 0.0
         matched_topics = []
@@ -624,14 +753,14 @@ def _x_topic_boost(items: list[NewsItem], cfg: PipelineConfig) -> None:
                         best_boost = b
                     if rule.get("topic") not in matched_topics:
                         matched_topics.append(rule.get("topic"))
-                    break  # ?????????,???? topic
+                    break  # 每条规则匹配到第一个关键词即止，记录 topic
         if best_boost > 0:
-            item.score = round(item.score + best_boost - 1.0, 3)  # ??? = boost-1.0
+            item.score = round(item.score + best_boost - 1.0, 3)  # 实际加权 = boost-1.0
             item.raw = item.raw or {}
             item.raw["x_topics"] = matched_topics
             boosted += 1
     if boosted:
-        print(f"[Process] X ????: {boosted}/{sum(1 for i in items if 'x-kol' in (i.tags or []) or 'x-official' in (i.tags or []))} X ???????")
+        print(f"[Process] X 主题加权: {boosted}/{sum(1 for i in items if 'x-kol' in (i.tags or []) or 'x-official' in (i.tags or []))} X 条匹配主题加权")
 
 
 def process_items_dual(items: list[NewsItem], cfg: PipelineConfig) -> dict[str, dict]:
@@ -640,13 +769,13 @@ def process_items_dual(items: list[NewsItem], cfg: PipelineConfig) -> dict[str, 
     Returns {"publish": {category dict}, "learning": {category dict}}.
     Items tagged purpose=both appear in both sets. This is the dual-mode entry
     point: pipeline.py calls this so processed.json carries two independent
-    result sets, and the digest step can generate a publish?? (-> WeChat) and
-    a learning?? (-> local only) without cross-contamination.
+    result sets, and the digest step can generate a publish 版（-> WeChat） and
+    a learning 版（-> local only） without cross-contamination.
     """
     pub_items = _filter_by_purpose(items, "publish")
     learn_items = _filter_by_purpose(items, "learning")
     print(f"[Process] dual split: {len(pub_items)} publish + {len(learn_items)} learning ({len(items)} total, both counted twice)")
-    # ?????? learning ???(publish ??????,??? X ?????)
+    # 只对 learning 做主题加权（publish 版保持原样，不受 X 加权影响）
     _x_topic_boost(learn_items, cfg)
     return {
         "publish": process_items(pub_items, cfg),

@@ -118,12 +118,12 @@ def _heuristic_card(item: dict) -> dict:
         summary = re.sub(r"^RT by @\S+:\s*", "", summary)
         summary = re.sub(r"^R to @\S+:\s*", "", summary)
         why_worth = summary[:100]
-        parts = re.split(r"[.?;?!???]", summary)
+        parts = re.split(r"[.?;?!\u3002\uff01\uff1f]", summary)
         core_points = [p.strip()[:50] for p in parts if len(p.strip()) > 8][:4]
         if len(core_points) < 2:
             core_points = [summary[:60]]
     else:
-        why_worth = f"?? {source} ?????"
+        why_worth = f"来自 {source} 的资讯"
         core_points = []
 
     return {
@@ -236,8 +236,9 @@ def _enhance_with_llm(items: list[dict], cfg: PipelineConfig) -> dict[str, dict]
                 idx = int(r.get("idx", 0))
                 # Local idx 1..N within this batch → position in batch_items
                 pos = idx - 1
-                if 0 <= pos < len(batch_items):
-                    url = batch_items[pos]["url"]
+                if not (0 <= pos < len(batch_items)):
+                    continue
+                url = batch_items[pos]["url"]
                 if url:
                     cp = r.get("core_points", [])
                     if isinstance(cp, str):
@@ -324,25 +325,36 @@ def generate_daily_digest(cfg: PipelineConfig, date_str: str | None = None, purp
     # Dual-mode: read from the purpose section if present, else top-level (legacy)
     if purpose in processed:
         section = processed[purpose]
-        news_items = section.get("news", {}).get("items", [])
-        papers_items = section.get("papers", {}).get("items", [])
-        semi_news_items = section.get("semiconductor_news", {}).get("items", [])
-        semi_papers_items = section.get("semiconductor_papers", {}).get("items", [])
     else:
-        news_items = processed.get("news", {}).get("items", [])
-        papers_items = processed.get("papers", {}).get("items", [])
-        semi_news_items = processed.get("semiconductor_news", {}).get("items", [])
-        semi_papers_items = processed.get("semiconductor_papers", {}).get("items", [])
-    # Backward compat: old format stored semiconductor as a single merged bucket.
-    # Split it into news vs papers (by arxiv tag) instead of dumping everything
-    # into news, which previously made the semiconductor-papers section empty.
-    if not semi_news_items and not semi_papers_items:
-        legacy = processed.get("semiconductor", {}).get("items", [])
-        semi_news_items = [i for i in legacy if not _is_legacy_arxiv(i)]
-        semi_papers_items = [i for i in legacy if _is_legacy_arxiv(i)]
+        section = processed
+
+    # Config-driven category reading: iterate the categories configured for
+    # the publish scope (or learning scope). Each category has news_key +
+    # papers_key that map to keys in processed.json.
+    scope = "knowledge_base" if purpose == "learning" else "publish"
+    cat_list = cfg.get_categories(scope)
+
+    # Build a dict {category_name: {"news": [...], "papers": [...]}} for later
+    # use by write_section and headline/enhance logic.
+    cat_data: dict[str, dict[str, list]] = {}
+    for cat in cat_list:
+        news_items_c = section.get(cat["news_key"], {}).get("items", [])
+        papers_items_c = section.get(cat["papers_key"], {}).get("items", [])
+        # Legacy compat: old format stored semiconductor as a single merged
+        # bucket. Split by arxiv tag so semi-papers isn't silently empty.
+        if cat["name"] == "semiconductor" and not news_items_c and not papers_items_c:
+            legacy = section.get("semiconductor", {}).get("items", [])
+            news_items_c = [i for i in legacy if not _is_legacy_arxiv(i)]
+            papers_items_c = [i for i in legacy if _is_legacy_arxiv(i)]
+        cat_data[cat["name"]] = {"news": news_items_c, "papers": papers_items_c, "cat": cat}
+
+    # Flat lists for enhance/headline
+    all_items_flat: list[dict] = []
+    for cd in cat_data.values():
+        all_items_flat.extend(cd["news"])
+        all_items_flat.extend(cd["papers"])
 
     use_llm = cfg.config.get("publish", {}).get("digest_use_llm", True)
-    all_semi = semi_news_items + semi_papers_items
     if use_llm:
         # Cooldown: the three-gate scorer + headline picker already hit the GLM
         # API hard. Wait for the per-minute rate-limit window to reset before
@@ -350,26 +362,38 @@ def generate_daily_digest(cfg: PipelineConfig, date_str: str | None = None, purp
         cooldown = int(cfg.config.get("processor", {}).get("llm_scorer", {}).get("enhance_cooldown_seconds", 60))
         print(f"[Digest] Cooling down {cooldown}s before card enhancement (API rate-limit reset)...")
         time.sleep(cooldown)
-    enhanced = _enhance_with_llm(news_items + papers_items + all_semi, cfg) if use_llm else {}
+    enhanced = _enhance_with_llm(all_items_flat, cfg) if use_llm else {}
 
     weekday = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
     wcn = {"Monday":"周一","Tuesday":"周二","Wednesday":"周三","Thursday":"周四","Friday":"周五","Saturday":"周六","Sunday":"周日"}.get(weekday,"")
-    lines = [f"AI Daily | {date_str} {wcn}", "",
-             f"> 今日精选 {len(news_items)} 条 AI 资讯 + {len(papers_items)} 篇文献 + {len(semi_news_items)} 条半导体资讯 + {len(semi_papers_items)} 篇半导体文献", ""]
+    # Build summary line from configured categories
+    cat_counts = []
+    for cd in cat_data.values():
+        nc = len(cd["news"])
+        pc = len(cd["papers"])
+        cat = cd["cat"]
+        if nc:
+            cat_counts.append(f"{nc} 条 {cat['label']}")
+        if pc:
+            cat_counts.append(f"{pc} 篇 {cat['papers_label']}")
+    summary = " + ".join(cat_counts) if cat_counts else "0 条"
+    lines = [f"AI 每日资讯 | {date_str} {wcn}", "",
+            f"> 今日精选 {summary}", ""]
 
     # ★ 今日大事件: LLM picks the single most important item of the day.
     # Falls back silently (no headline card) if LLM is off or the pick fails.
-    head_candidates = (news_items + papers_items)[:8]
+    head_candidates = all_items_flat[:8]
     headline = None
     if use_llm and head_candidates:
         headline = _pick_headline_with_llm(head_candidates, cfg)
     if headline:
         h_item = headline["item"]
-        # Dedup: remove the headline item from the section lists so it doesn't
-        # appear twice (once as ?????, once inside its category section).
+        # Dedup: remove the headline item from category data so it doesn't
+        # appear twice (once as 今日大事件, once inside its category section).
         h_url = h_item.get("url", "")
-        news_items = [i for i in news_items if i.get("url") != h_url]
-        papers_items = [i for i in papers_items if i.get("url") != h_url]
+        for cd in cat_data.values():
+            cd["news"] = [i for i in cd["news"] if i.get("url") != h_url]
+            cd["papers"] = [i for i in cd["papers"] if i.get("url") != h_url]
         h_url = h_item.get("url", "")
         h_gates = (h_item.get("raw") or {}).get("llm_gates") or {}
         if h_gates.get("cn_title"):
@@ -438,12 +462,15 @@ def generate_daily_digest(cfg: PipelineConfig, date_str: str | None = None, purp
             lines.append("---")
             lines.append("")
 
-    write_section("📰", "今日资讯", news_items)
-    write_section("📚", "学术文献", papers_items)
-    write_section("🔬", "半导体资讯", semi_news_items)
-    write_section("📄", "半导体文献", semi_papers_items)
+    # Write sections from configured categories
+    for cd in cat_data.values():
+        cat = cd["cat"]
+        if cd["news"]:
+            write_section(cat["emoji"], cat["label"], cd["news"])
+        if cd["papers"]:
+            write_section(cat["papers_emoji"], cat["papers_label"], cd["papers"])
 
-    lines.append(f"*AI Daily | {date_str} | 自动生成*")
+    lines.append(f"*AI 每日资讯 | {date_str} | 自动生成*")
 
     # publish -> main account dir (auto-pushes to WeChat)
     # learning -> personal dir (stays local, never published)
@@ -474,10 +501,14 @@ def generate_daily_digest(cfg: PipelineConfig, date_str: str | None = None, purp
             pass
 
     (out_dir / "meta.json").write_text(json.dumps(
-        {"type": "daily_digest", "date": date_str, "news_count": len(news_items),
-         "papers_count": len(papers_items), "llm_enhanced": len(enhanced)},
+        {"type": "daily_digest", "date": date_str,
+         "news_count": sum(len(cd["news"]) for cd in cat_data.values()),
+         "papers_count": sum(len(cd["papers"]) for cd in cat_data.values()),
+         "llm_enhanced": len(enhanced)},
         ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"[Digest] {article_md} ({len(news_items)}N+{len(papers_items)}P" +
+    total_n = sum(len(cd["news"]) for cd in cat_data.values())
+    total_p = sum(len(cd["papers"]) for cd in cat_data.values())
+    print(f"[Digest] {article_md} ({total_n}N+{total_p}P" +
           (f", {len(enhanced)} LLM)" if enhanced else ")"), flush=True)
     return out_dir

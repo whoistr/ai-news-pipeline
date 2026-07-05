@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,17 +36,8 @@ class PipelineConfig:
 
     @property
     def wechat_skill_path(self) -> Path:
-        # 1. Env var override (highest priority) for standalone skill installs
-        env_path = os.environ.get("WECHAT_PUBLISHER_PATH")
-        if env_path and Path(env_path).is_dir():
-            return Path(env_path).resolve()
-        configured = self.config["wechat_publisher"]["skill_path"]
-        # 2. Absolute path in config
-        if os.path.isabs(configured):
-            return Path(configured).resolve()
-        # 3. Relative: resolve against skills dir (sibling layout).
-        #    config root = <skills>/ai-news-pipeline/, so root.parent = <skills>/
-        return (self.repo_root / configured).resolve()
+        rel = self.config["wechat_publisher"]["skill_path"]
+        return (self.repo_root / rel).resolve()
 
     @property
     def wechat_scripts_dir(self) -> Path:
@@ -57,12 +49,75 @@ class PipelineConfig:
         return self.config["account"]["default"]
 
     @property
-    def tz(self) -> timezone:
-        """Local timezone for date-window calculations (default UTC+8 / Asia-Shanghai)."""
-        # Simple fixed-offset: config timezone string parsed to hours.
+    def tz(self):
+        """Local timezone for date-window calculations (default Asia/Shanghai).
+
+        Uses zoneinfo for real IANA timezone support. Falls back to a fixed
+        UTC+8 offset if zoneinfo data is unavailable (e.g. Windows without
+        the tzdata package installed). Never raises.
+        """
         tz_str = self.config.get("pipeline", {}).get("timezone", "Asia/Shanghai")
-        offset_hours = 8 if "Shanghai" in tz_str or "China" in tz_str else 0
-        return timezone(timedelta(hours=offset_hours))
+        try:
+            return ZoneInfo(tz_str)
+        except Exception:
+            try:
+                return ZoneInfo("Asia/Shanghai")
+            except Exception:
+                print("[Config] warning: zoneinfo data unavailable, using fixed UTC+8")
+            return timezone(timedelta(hours=8))
+
+
+    def get_categories(self, scope: str = "publish") -> list[dict[str, str]]:
+        """Resolve which domain categories to include for a given scope.
+
+        Reads scope.categories from config (a list of category names), then
+        looks up each name in the top-level 'categories' section to get its
+        news_key / papers_key / label / emoji.
+
+        Args:
+            scope: "publish" or "knowledge_base" -- which config section to
+                   read the category selection from.
+
+        Returns: list of dicts, each like:
+            {"name": "ai", "news_key": "news", "papers_key": "papers",
+             "label": "今日资讯", "papers_label": "学术文献",
+             "emoji": "📰", "papers_emoji": "📚"}
+            Ordered by the scope.categories list.
+
+        Falls back to [ai, semiconductor] if not configured (backward compat).
+        """
+        scope_cfg = self.config.get(scope, {})
+        cat_names = scope_cfg.get("categories", [])
+        all_cats = self.config.get("categories", {})
+
+        if not cat_names or not all_cats:
+            # Default: AI + semiconductor (legacy behavior)
+            cat_names = ["ai", "semiconductor"]
+            all_cats = {
+                "ai": {"news_key": "news", "papers_key": "papers",
+                       "label": "今日资讯", "papers_label": "学术文献",
+                       "emoji": "📰", "papers_emoji": "📚"},
+                "semiconductor": {"news_key": "semiconductor_news",
+                                  "papers_key": "semiconductor_papers",
+                                  "label": "半导体资讯", "papers_label": "半导体文献",
+                                  "emoji": "🔬", "papers_emoji": "📄"},
+            }
+
+        result = []
+        for name in cat_names:
+            cat = all_cats.get(name, {})
+            if not cat:
+                continue
+            result.append({
+                "name": name,
+                "news_key": cat.get("news_key", f"{name}_news"),
+                "papers_key": cat.get("papers_key", f"{name}_papers"),
+                "label": cat.get("label", name),
+                "papers_label": cat.get("papers_label", f"{name} 文献"),
+                "emoji": cat.get("emoji", "📌"),
+                "papers_emoji": cat.get("papers_emoji", "📄"),
+            })
+        return result
 
     def date_window(self, date_str: str) -> tuple[datetime, datetime]:
         """Return [start, end) UTC datetimes covering the full calendar day of date_str in local tz.

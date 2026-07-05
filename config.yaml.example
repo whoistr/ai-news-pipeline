@@ -21,13 +21,8 @@ account:
   default: main
 
 wechat_publisher:
-  # wechat-publisher skill 路径。三种解析方式：
-  #   1. 相对路径（默认）：相对 skills 目录，同级布局自动解析
-  #      例: wechat-publisher  →  <skills>/wechat-publisher/
-  #   2. 绝对路径：写完整路径
-  #      例: /home/user/.codex/skills/wechat-publisher
-  #   3. 环境变量 WECHAT_PUBLISHER_PATH（优先级最高，覆盖此配置）
-  skill_path: wechat-publisher
+  # wechat-publisher skill 路径（相对本仓库根目录）
+  skill_path: .agents/skills/wechat-publisher
   scripts_dir: scripts
 
 collectors:
@@ -67,6 +62,23 @@ collectors:
 
   # 只保留最近 N 小时内的条目
   max_age_hours: 72
+
+# 领域分类定义：pipeline 跟踪哪些垂直领域
+categories:
+  ai:
+    news_key: news
+    papers_key: papers
+    label: 今日资讯
+    papers_label: 学术文献
+    emoji: 📰
+    papers_emoji: 📚
+  semiconductor:
+    news_key: semiconductor_news
+    papers_key: semiconductor_papers
+    label: 半导体资讯
+    papers_label: 半导体文献
+    emoji: 🔬
+    papers_emoji: 📄
 
 processor:
   # 关键词加权（标题/摘要命中加分）
@@ -113,7 +125,19 @@ llm:
   temperature: 0.7
 
 publish:
+  # 微信日报包含哪些领域（按顺序输出）
+  categories: [ai, semiconductor]
   # 是否在 article.md 就绪后自动发布到微信草稿箱
   auto_publish: false
   ai_score_threshold: 45
   skip_ai_score: false
+
+# 知识回流：将采集信息生成知识卡片写入个人知识库
+knowledge_base:
+  enabled: true
+  # 个人知识库日报包含哪些领域
+  categories: [ai, semiconductor]
+  # Obsidian 库根目录（可配置，换库只改这一行）
+  vault_root: ~/Documents/ObsidianVault
+  # 资讯收集子路径（相对 vault_root，调结构改这一行）
+  news_subpath: 03-知识库/1-iDeaBox/每日资讯收集

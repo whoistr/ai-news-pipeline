@@ -9,6 +9,7 @@ from ai_news_pipeline.collectors.rss import RssCollector
 from ai_news_pipeline.config import PipelineConfig
 from ai_news_pipeline.generators.brief import create_brief
 from ai_news_pipeline.generators.daily_digest import generate_daily_digest
+from ai_news_pipeline.generators.knowledge_card import generate_daily_knowledge_card, generate_paper_knowledge_card
 from ai_news_pipeline.generators.llm import generate_article_with_llm
 from ai_news_pipeline.models import NewsItem, utc_now_iso
 from ai_news_pipeline.processors.ranker import load_processed, process_items, process_items_dual, save_processed
@@ -144,6 +145,49 @@ def digest_news(cfg: PipelineConfig, date_str: str | None = None) -> Path:
         result = publish_to_wechat(out_dir, cfg)
         print(f"[Digest] Published to drafts: {result['title']}")
     return out_dir
+def _generate_knowledge_feedback(cfg: PipelineConfig, date_str: str) -> None:
+    """Generate daily knowledge digests (AI news + papers) to Obsidian vault.
+
+    Splits items by form: news/semi_news -> AI日报, papers/semi_papers -> 文献日报.
+    Both land in the same {date}/ directory, distinguished by filename prefix.
+    """
+    import json as _json
+
+    processed_path = cfg.processed_dir / f"{date_str}.json"
+    if not processed_path.is_file():
+        print("[KnowledgeCard] No processed data, skipping")
+        return
+
+    data = _json.loads(processed_path.read_text(encoding="utf-8"))
+
+    # Prefer the learning section, fall back to publish if learning is empty.
+    def _split_by_form(section):
+        """Split into news_items vs paper_items using configured categories."""
+        news_items = []
+        paper_items = []
+        for cat in cfg.get_categories("knowledge_base"):
+            news_items.extend(section.get(cat["news_key"], {}).get("items", []))
+            paper_items.extend(section.get(cat["papers_key"], {}).get("items", []))
+        return news_items, paper_items
+
+    learn_section = data.get("learning", {})
+    news_items, paper_items = _split_by_form(learn_section)
+    section_used = "learning"
+    if not news_items and not paper_items:
+        pub_section = data.get("publish", data)
+        news_items, paper_items = _split_by_form(pub_section)
+        section_used = "publish (fallback)"
+
+    print(f"[KnowledgeCard] Processing from {section_used}: "
+          f"{len(news_items)} news + {len(paper_items)} papers")
+
+    # Path A: news -> AI日报 (with full thinking layer)
+    if news_items:
+        generate_daily_knowledge_card(cfg, date_str, news_items)
+
+    # Path B: papers -> 文献日报 (compact candidate format)
+    if paper_items:
+        generate_paper_knowledge_card(cfg, date_str, paper_items)
 
 
 def learning_digest(cfg: PipelineConfig, date_str: str | None = None) -> Path:
@@ -151,6 +195,16 @@ def learning_digest(cfg: PipelineConfig, date_str: str | None = None) -> Path:
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
     _ensure_processed_fresh(cfg, date_str)
     out_dir = generate_daily_digest(cfg, date_str, purpose="learning")
+
+    # Knowledge feedback: generate structured knowledge cards
+    # that flow back into the personal knowledge base (Obsidian vault).
+    kb_cfg = cfg.config.get("knowledge_base", {})
+    if kb_cfg.get("enabled", False):
+        try:
+            _generate_knowledge_feedback(cfg, date_str)
+        except Exception as e:
+            print(f"[Learning] Knowledge card generation failed: {e}")
+
     print(f"[Learning] Generated (local only, not published): {out_dir}")
     return out_dir
 
